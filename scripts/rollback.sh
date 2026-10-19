@@ -36,6 +36,23 @@ run() {
 
 log() { echo "==> $*"; }
 
+# Maximum seconds to wait for the on-chain upgrade delay to elapse.
+UPGRADE_DELAY_TIMEOUT="${UPGRADE_DELAY_TIMEOUT:-1800}"
+# Seconds between get_pending_upgrade polls.
+UPGRADE_DELAY_POLL_INTERVAL="${UPGRADE_DELAY_POLL_INTERVAL:-10}"
+
+# Resolve the admin signer address once so it can be passed as a JSON array.
+ADMIN_ADDRESS=$(soroban keys address "$ADMIN_IDENTITY" 2>/dev/null || true)
+if [ -z "$ADMIN_ADDRESS" ]; then
+  if [ "$DRY_RUN" = true ]; then
+    ADMIN_ADDRESS="<ADMIN>"
+  else
+    echo "ERROR: could not resolve address for admin identity '$ADMIN_IDENTITY'" >&2
+    exit 1
+  fi
+fi
+ADMIN_SIGNERS_JSON="[\"$ADMIN_ADDRESS\"]"
+
 # ── Safety check ──────────────────────────────────────────────
 if [ "$NETWORK" = "mainnet" ]; then
   echo ""
@@ -73,16 +90,46 @@ else
     --network "$NETWORK" \
     -- \
     propose_upgrade \
-    --admin-signers "$(soroban keys address "$ADMIN_IDENTITY" 2>/dev/null || echo '<ADMIN>')" \
+    --admin-signers "$ADMIN_SIGNERS_JSON" \
     --new-wasm-hash "$PREVIOUS_WASM_HASH" 2>&1)
   log "Proposal output: $PROPOSAL_OUTPUT"
 fi
 
-# ── Step 2: Monitor the delay ─────────────────────────────────
-log "Step 2: Waiting for upgrade delay to elapse"
-log "   Check pending upgrade status with:"
-log "   soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTITY --network $NETWORK -- get_pending_upgrade"
-log "   Execute only after executable_after has passed."
+# ── Step 2: Wait for the upgrade delay to elapse ──────────────
+log "Step 2: Waiting for upgrade delay to elapse (timeout ${UPGRADE_DELAY_TIMEOUT}s)"
+if [ "$DRY_RUN" = true ]; then
+  echo "[dry-run] poll get_pending_upgrade until executable_after has passed"
+else
+  DELAY_START=$(date +%s)
+  DELAY_ELAPSED=false
+  while true; do
+    PENDING_OUTPUT=$(soroban contract invoke \
+      --id "$TARGET_CONTRACT_ID" \
+      --source "$ADMIN_IDENTITY" \
+      --network "$NETWORK" \
+      -- \
+      get_pending_upgrade 2>&1 || true)
+    log "Pending upgrade: $PENDING_OUTPUT"
+
+    # The contract returns an empty/none result once no upgrade is pending.
+    if echo "$PENDING_OUTPUT" | grep -qiE 'none|void|null|no pending'; then
+      log "No pending upgrade reported; delay has elapsed."
+      DELAY_ELAPSED=true
+      break
+    fi
+
+    NOW=$(date +%s)
+    if [ $((NOW - DELAY_START)) -ge "$UPGRADE_DELAY_TIMEOUT" ]; then
+      break
+    fi
+    sleep "$UPGRADE_DELAY_POLL_INTERVAL"
+  done
+
+  if [ "$DELAY_ELAPSED" != true ]; then
+    echo "ERROR: upgrade delay did not elapse within ${UPGRADE_DELAY_TIMEOUT}s" >&2
+    exit 1
+  fi
+fi
 
 # ── Step 3: Execute the rollback ──────────────────────────────
 if [ "$NON_INTERACTIVE" = true ]; then
@@ -94,15 +141,18 @@ fi
 
 log "Step 3: Executing rollback upgrade"
 if [ "$DRY_RUN" = true ]; then
-  echo "[dry-run] soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTITY --network $NETWORK -- execute_upgrade --admin-signers '[$ADMIN_IDENTITY]'"
+  echo "[dry-run] soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTITY --network $NETWORK -- execute_upgrade --admin-signers '$ADMIN_SIGNERS_JSON'"
 else
-  EXECUTE_OUTPUT=$(soroban contract invoke \
+  if ! EXECUTE_OUTPUT=$(soroban contract invoke \
     --id "$TARGET_CONTRACT_ID" \
     --source "$ADMIN_IDENTITY" \
     --network "$NETWORK" \
     -- \
     execute_upgrade \
-    --admin-signers "$(soroban keys address "$ADMIN_IDENTITY" 2>/dev/null || echo '<ADMIN>')" 2>&1)
+    --admin-signers "$ADMIN_SIGNERS_JSON" 2>&1); then
+    echo "ERROR: execute_upgrade failed: $EXECUTE_OUTPUT" >&2
+    exit 1
+  fi
   log "Execute output: $EXECUTE_OUTPUT"
 fi
 
@@ -117,7 +167,7 @@ if [ "$DRY_RUN" = false ]; then
     get_version 2>/dev/null || echo "VERIFY_FAILED")
 
   if [ "$VERIFY_VERSION" = "VERIFY_FAILED" ]; then
-    log "ERROR: Rollback verification failed — get_version returned an error."
+    echo "ERROR: Rollback verification failed — get_version returned an error." >&2
     exit 1
   fi
 
@@ -131,7 +181,7 @@ if [ "$DRY_RUN" = false ]; then
     get_admin 2>/dev/null || echo "VERIFY_FAILED")
 
   if [ "$VERIFY_ADMIN" = "VERIFY_FAILED" ]; then
-    log "ERROR: Rollback verification failed — get_admin returned an error."
+    echo "ERROR: Rollback verification failed — get_admin returned an error." >&2
     exit 1
   fi
 

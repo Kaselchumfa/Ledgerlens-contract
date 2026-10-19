@@ -105,7 +105,12 @@ NEW_WASM_PATH="${4:?ERROR: new-wasm-path argument is required}"
 
 TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(TS)] $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log"; }
-die() { echo "[$(TS)] ERROR: $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2; exit 1; }
+die() {
+  echo "[$(TS)] ERROR: $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2
+  # Record a terminal status so the status file never stays at "pending".
+  write_status "failed" "fail" "fail" "$*" || true
+  exit 1
+}
 
 run() {
   if [ "$DRY_RUN" = true ]; then
@@ -177,11 +182,12 @@ write_status() {
     version="<VERSION>"
   fi
   if command -v python3 >/dev/null 2>&1; then
-    STAGING_STATUS_FILE="$STAGING_STATUS_FILE" python3 - "$status" "$health" "$canary" "$note" "$CONTRACT_ID" "$NETWORK" "$NEW_WASM_HASH" "$PREVIOUS_WASM_HASH" "$version" "$commit_sha" "$run_url" <<'EOF'
-import json, sys, datetime
+    STAGING_STATUS_FILE="$STAGING_STATUS_FILE" STAGING_SCHEMA_FILE="$PROJECT_ROOT/deploy/staging.schema.json" \
+      python3 - "$status" "$health" "$canary" "$note" "$CONTRACT_ID" "$NETWORK" "$NEW_WASM_HASH" "$PREVIOUS_WASM_HASH" "$version" "$commit_sha" "$run_url" <<'EOF'
+import json, sys, datetime, os
 (status, health, canary, note, contract_id, network, wasm, prev_wasm, version, commit, run_url) = sys.argv[1:12]
-import os
 path = os.environ["STAGING_STATUS_FILE"]
+schema_path = os.environ.get("STAGING_SCHEMA_FILE", "")
 try:
     with open(path) as f:
         data = json.load(f)
@@ -202,6 +208,22 @@ data.update({
     "workflow_run_url": run_url,
     "last_deploy_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 })
+
+# Validate against the schema's required keys before writing, so a malformed
+# status file can never be published.
+required = []
+if schema_path and os.path.exists(schema_path):
+    try:
+        with open(schema_path) as f:
+            schema = json.load(f)
+        required = list(schema.get("required", []))
+    except (OSError, json.JSONDecodeError):
+        required = []
+missing = [k for k in required if k not in data]
+if missing:
+    sys.stderr.write(f"ERROR: staging status missing required keys {missing}; refusing to write {path}\n")
+    sys.exit(1)
+
 with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
@@ -289,9 +311,17 @@ else
         break
       fi
       if [ "$NOW" -ge "$DEADLINE" ]; then
-        log "Delay window not yet elapsed within ${MAX_WAIT_SECS}s — leaving proposal pending for the scheduled follow-up"
-        write_status "proposed-pending" "pass" "pending" "awaiting executable_after; proposal recorded"
-        exit 2
+        # Only report proposed-pending when the delay genuinely has not elapsed.
+        if [ -n "$EXEC_AFTER" ] && [ "$EXEC_AFTER" -gt "$NOW" ]; then
+          log "Delay window not yet elapsed within ${MAX_WAIT_SECS}s — leaving proposal pending for the scheduled follow-up"
+          write_status "proposed-pending" "pass" "pending" "awaiting executable_after; proposal recorded"
+          exit 2
+        fi
+        # The delay has elapsed (or the pending state is unreadable): this run
+        # cannot execute, so record a terminal failure instead of pending.
+        log "ERROR: upgrade window elapsed but execute could not proceed (pending state: $PENDING)"
+        write_status "failed" "fail" "fail" "executable window reached but execute_upgrade not run"
+        exit 1
       fi
       sleep "$POLL_INTERVAL_SECS"
     done
@@ -305,6 +335,7 @@ if [ "$NON_INTERACTIVE" = false ] && [ "$DRY_RUN" = false ]; then
 fi
 if ! EXEC_OUT="$(invoke execute_upgrade --admin-signers "[$ADMIN_ADDRESS]" 2>&1)"; then
   echo "$EXEC_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
+  # rollback() writes rolled-back on successful restoration, failed otherwise.
   rollback "execute_upgrade failed: $EXEC_OUT"
   exit 1
 fi

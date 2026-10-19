@@ -77,6 +77,20 @@ suppresses CI, so the status commit cannot retrigger this pipeline).
 Integrators poll this file (or the `staging-deployment-evidence` run
 artifact) instead of asking operators for the current staging address.
 
+### Status semantics
+
+| Status | Meaning |
+|---|---|
+| `pending` | **Initial placeholder only.** Written before the run does any work and always overwritten before the run ends. A `pending` value observed *after* a run has completed means the status was never rewritten (e.g. the job was cancelled or the commit-back step failed) — treat it as a failure and inspect the run, never as "in progress". |
+| `deployed` | `execute_upgrade` succeeded and both health and canary checks passed. |
+| `proposed-pending` | Proposal accepted; the time-lock has not yet elapsed (see §4). The hourly schedule completes execution. |
+| `rolled-back` | A post-execute failure triggered `rollback.sh`, the previous WASM was restored, **and** post-rollback health checks passed. |
+| `failed` | Manual intervention required. Written for baseline-health failure (fail closed before proposing), `propose_upgrade` failure, `execute_upgrade` failure, or a rollback whose post-rollback health checks did not pass. |
+
+`rolled-back` is only ever recorded when the restored instance is verified
+healthy; if rollback itself cannot be verified, the status is `failed`.
+=======
+
 ## 4. The time-lock is honoured, not bypassed
 
 Staging uses the **same** `propose_upgrade` / `execute_upgrade` entrypoints
@@ -186,6 +200,23 @@ Rules:
    `docs/incident-response-runbook.md` (freeze if needed, snapshots,
    reconcile) before re-running.
 4. Close the loop on the issue with the root cause and the green run link.
+
+### Troubleshooting a reported staging failure
+
+When a "Staging deployment failed" issue is filed (see §6), the status field
+in `deploy/staging.json` and `staging-upgrade.log` in the
+`staging-deployment-evidence` artifact together identify the failure point:
+
+| Status | Where to look in `staging-upgrade.log` |
+|---|---|
+| `pending` | The run never reached the status write — check for cancellation or a failed commit-back step; the log ends before the final status record. |
+| `failed` | Baseline health (before propose), `propose_upgrade`, `execute_upgrade`, or post-rollback health. The last failing step is the root cause. |
+| `rolled-back` | Post-execute failure followed by a verified rollback; the log shows the failing check and the successful post-rollback health run. |
+| `proposed-pending` | Not a failure by itself; only escalate if it persists beyond one delay window (§4). |
+
+For the four reported runs (#1471–#1474) the placeholder `pending` status
+indicates the status write never completed; read `staging-upgrade.log` from
+the linked run to find the last executed step before proceeding.
 
 ### Local rehearsal (no network)
 

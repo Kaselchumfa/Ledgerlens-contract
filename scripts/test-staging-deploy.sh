@@ -178,6 +178,65 @@ else
   not_ok "broken change records rolled-back in the status file"
 fi
 
+# ── 5. Failure semantics: never leave status=pending ──────────────────────
+# Regression guard for issues #1471-#1474: a failed promotion must record
+# status=failed (or rolled-back), never the initial placeholder `pending`.
+
+# 5a. Non-zero exit with no rollback source must record status=failed.
+NO_ROLLBACK_STATUS="$TMP_DIR/staging-no-rollback.json"
+NO_ROLLBACK_LOG="$TMP_DIR/no-rollback.log"
+set +e
+PATH="$STUB_DIR:$PATH" STAGING_ALLOW_SKIP_DELAY_WAIT=1 \
+  "$UPGRADE_SCRIPT" --non-interactive --skip-delay-wait \
+  --evidence-dir "$EVIDENCE_DIR" --staging-status "$NO_ROLLBACK_STATUS" \
+  testnet staging-deployer CSTAGINGXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+  "$TMP_DIR/new.wasm" >"$NO_ROLLBACK_LOG" 2>&1
+NO_ROLLBACK_CODE=$?
+set -e
+
+if [ "$NO_ROLLBACK_CODE" -ne 0 ]; then ok; else not_ok "missing rollback source exits non-zero (got $NO_ROLLBACK_CODE)"; fi
+if [ -f "$NO_ROLLBACK_STATUS" ] && \
+   python3 -c "import json,sys; assert json.load(open(sys.argv[1]))['status']=='failed'" "$NO_ROLLBACK_STATUS" 2>/dev/null; then
+  ok
+else
+  not_ok "missing rollback source records status=failed (not pending)"
+fi
+
+# 5b. Baseline-health failure must record status=failed.
+BASELINE_STATUS="$TMP_DIR/staging-baseline.json"
+BASELINE_LOG="$TMP_DIR/baseline.log"
+set +e
+PATH="$STUB_DIR:$PATH" STAGING_ALLOW_SKIP_DELAY_WAIT=1 STAGING_BASELINE_HEALTH_FAIL=1 \
+  "$UPGRADE_SCRIPT" --non-interactive --skip-delay-wait \
+  --evidence-dir "$EVIDENCE_DIR" --staging-status "$BASELINE_STATUS" \
+  --previous-wasm "$TMP_DIR/prev.wasm" \
+  testnet staging-deployer CSTAGINGXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+  "$TMP_DIR/new.wasm" >"$BASELINE_LOG" 2>&1
+BASELINE_CODE=$?
+set -e
+
+if [ "$BASELINE_CODE" -ne 0 ]; then ok; else not_ok "baseline-health failure exits non-zero (got $BASELINE_CODE)"; fi
+if [ -f "$BASELINE_STATUS" ] && \
+   python3 -c "import json,sys; assert json.load(open(sys.argv[1]))['status']=='failed'" "$BASELINE_STATUS" 2>/dev/null; then
+  ok
+else
+  not_ok "baseline-health failure records status=failed (not pending)"
+fi
+
+# 5c. No simulated failed run may leave the status file at `pending`.
+for status in "$STATUS_FILE" "$NO_ROLLBACK_STATUS" "$BASELINE_STATUS"; do
+  if [ -f "$status" ] && \
+     python3 -c "import json,sys; assert json.load(open(sys.argv[1]))['status']!='pending'" "$status" 2>/dev/null; then
+    ok
+  else
+    not_ok "status file $status must not remain pending after a failed run"
+  fi
+done
+
+# 5d. Workflow must rewrite a leftover `pending` status to `failed`.
+assert_contains "workflow rewrites leftover pending status to failed" "$WORKFLOW" "pending"
+assert_contains "workflow records failed status on unsuccessful promotion" "$WORKFLOW" "failed"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

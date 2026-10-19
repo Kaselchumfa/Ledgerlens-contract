@@ -210,8 +210,39 @@ jobs:
           CODE=$?
           set -e
           echo "staging-upgrade exit code: $CODE"
+          STATUS="unknown"
           if [ -f deploy/staging.json ]; then
             STATUS=$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))")
+            echo "staging_status=$STATUS" >> "$GITHUB_OUTPUT"
+          fi
+          # A failed upgrade/verification must never leave the placeholder
+          # `pending` status behind: record a real `failed` status so the
+          # status file, evidence artifact and failure issue are accurate.
+          if [ "$CODE" -ne 0 ] && { [ "$STATUS" = "pending" ] || [ "$STATUS" = "unknown" ]; }; then
+            echo "Upgrade failed (exit $CODE) but status is still '$STATUS'; recording 'failed'."
+            python3 - "$CODE" "$GITHUB_RUN_URL" <<'EOF'
+          import json
+          import sys
+
+          code, run_url = sys.argv[1], sys.argv[2]
+          path = "deploy/staging.json"
+          try:
+              with open(path) as f:
+                  data = json.load(f)
+          except FileNotFoundError:
+              data = {}
+          data["status"] = "failed"
+          data["note"] = f"staging-upgrade.sh exited with code {code}; see {run_url}"
+          for key in ("health", "canary"):
+              if isinstance(data.get(key), dict):
+                  data[key]["status"] = "fail"
+              else:
+                  data[key] = {"status": "fail"}
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          EOF
+            STATUS="failed"
             echo "staging_status=$STATUS" >> "$GITHUB_OUTPUT"
           fi
           # Exit 2 = proposal recorded, awaiting the time-lock window: not a failure.
@@ -238,6 +269,14 @@ jobs:
           assert data["status"] in schema["properties"]["status"]["enum"]
           print("staging.json schema check passed.")
           EOF
+          # A non-dry-run deploy must never finish with the placeholder status.
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            STATUS=$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))")
+            if [ "$STATUS" = "pending" ]; then
+              echo "ERROR: deploy/staging.json still records placeholder status 'pending' after a real deploy." >&2
+              exit 1
+            fi
+          fi
 
       - name: Commit staging status back ([skip ci])
         if: always()
@@ -271,7 +310,7 @@ jobs:
           retention-days: 90
 
       - name: Notify maintainers on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

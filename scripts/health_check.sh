@@ -20,6 +20,12 @@ SOURCE_IDENTITY="${3:-health-check}"
 
 FAILURES=0
 
+# Bounded retry policy for view calls: transient RPC failures should not fail
+# the whole verification (and trigger an unnecessary rollback), so each call is
+# retried a small number of times with a short linear backoff.
+MAX_ATTEMPTS="${HEALTH_CHECK_MAX_ATTEMPTS:-3}"
+RETRY_DELAY_SECONDS="${HEALTH_CHECK_RETRY_DELAY:-2}"
+
 invoke() {
   soroban contract invoke \
     --id "$CONTRACT_ID" \
@@ -29,14 +35,34 @@ invoke() {
     "$@"
 }
 
+# Runs a command up to MAX_ATTEMPTS times, sleeping RETRY_DELAY_SECONDS between
+# attempts. On success, sets RETRY_OUTPUT to the command output and
+# RETRY_ATTEMPTS to the number of attempts used, and returns 0. On exhaustion,
+# sets RETRY_OUTPUT to the last error output and returns 1.
+retry() {
+  local attempt=1
+  RETRY_ATTEMPTS=0
+  RETRY_OUTPUT=""
+  while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    RETRY_ATTEMPTS=$attempt
+    if RETRY_OUTPUT=$("$@" 2>&1); then
+      return 0
+    fi
+    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+      sleep "$RETRY_DELAY_SECONDS"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 check() {
   local label="$1"
   shift
-  local output
-  if output=$("$@" 2>&1); then
-    echo "PASS  $label: $output"
+  if retry "$@"; then
+    echo "PASS  $label: $RETRY_OUTPUT (attempts: $RETRY_ATTEMPTS/$MAX_ATTEMPTS)"
   else
-    echo "FAIL  $label: $output"
+    echo "FAIL  $label: $RETRY_OUTPUT (attempts: $RETRY_ATTEMPTS/$MAX_ATTEMPTS)"
     FAILURES=$((FAILURES + 1))
   fi
 }
@@ -51,15 +77,15 @@ check "service liveness" invoke is_service_alive
 
 # A pending upgrade proposal is optional state: its absence (Error::NoPendingUpgrade,
 # discriminant #13) is healthy, not a failure — only a genuine RPC/contract error is.
-if UPGRADE_OUTPUT=$(invoke get_pending_upgrade 2>&1); then
-  echo "INFO  pending upgrade: $UPGRADE_OUTPUT"
+if retry invoke get_pending_upgrade; then
+  echo "INFO  pending upgrade: $RETRY_OUTPUT (attempts: $RETRY_ATTEMPTS/$MAX_ATTEMPTS)"
 else
-  case "$UPGRADE_OUTPUT" in
+  case "$RETRY_OUTPUT" in
     *NoPendingUpgrade*|*'#13'*)
-      echo "PASS  pending upgrade: none"
+      echo "PASS  pending upgrade: none (attempts: $RETRY_ATTEMPTS/$MAX_ATTEMPTS)"
       ;;
     *)
-      echo "FAIL  pending upgrade: $UPGRADE_OUTPUT"
+      echo "FAIL  pending upgrade: $RETRY_OUTPUT (attempts: $RETRY_ATTEMPTS/$MAX_ATTEMPTS)"
       FAILURES=$((FAILURES + 1))
       ;;
   esac
